@@ -147,6 +147,10 @@ def process_all_ebe(
     records = []
     columns = ["file", "runs", "N", "ci_radius", "M_graphs", "stats"]
     for path in paths:
+        if ci_radius_filter is not None:
+            radius = extract_ci_radius(path.name)
+            if radius != ci_radius_filter:
+                continue
         df, meta = read_ebe_file(path)
         stats = compute_column_stats(df)
         if write_files:
