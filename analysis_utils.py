@@ -34,6 +34,10 @@ COLUMN_MAP: Sequence[Tuple[int, str]] = [
     (22, "nl_q_minus"),
     (23, "p2"),
     (24, "p1"),
+    (25, "core_p_star"),
+    (26, "core_drop"),
+    (27, "core_size_star"),
+    (28, "core_zero_p"),
 ]
 
 COLUMN_LOOKUP: Dict[int, str] = {idx: name for idx, name in COLUMN_MAP}
@@ -41,6 +45,58 @@ COLUMN_LOOKUP: Dict[int, str] = {idx: name for idx, name in COLUMN_MAP}
 N_PATTERN = re.compile(r"_N(\d+)")
 L_PATTERN = re.compile(r"_L(\d+)")
 MG_PATTERN = re.compile(r"_Mg(\d+)")
+PLOT_DIR = Path("node_percolation") / "plots"
+
+
+def _ensure_plot_dir() -> Path:
+    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    return PLOT_DIR
+
+
+def _sanitize_stem(stem: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_")
+    if not cleaned:
+        return "figure"
+    return cleaned[:40]
+
+
+def _save_figure(fig: plt.Figure, stem: str, L_value: Optional[int] = None) -> Path:
+    directory = _ensure_plot_dir()
+    filename = _sanitize_stem(stem)
+    if L_value is not None:
+        filename = f"{filename}_L{L_value}"
+    path = directory / f"{filename}.png"
+    counter = 1
+    while path.exists():
+        path = directory / f"{filename}_{counter}.png"
+        counter += 1
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    return path
+
+
+def _infer_L_value(df: pd.DataFrame) -> Optional[int]:
+    if getattr(df, "attrs", None) and "L_value" in df.attrs:
+        return df.attrs["L_value"]
+    for col in ("L", "ci_radius"):
+        if col in df.columns:
+            series = df[col].dropna().unique()
+            if len(series) == 1:
+                try:
+                    return int(series[0])
+                except (TypeError, ValueError):
+                    pass
+    if "source" in df.columns:
+        values = []
+        for src in df["source"]:
+            if pd.isna(src):
+                continue
+            radius = extract_ci_radius(str(src))
+            if radius is not None:
+                values.append(radius)
+        uniq = set(values)
+        if len(uniq) == 1:
+            return uniq.pop()
+    return None
 
 
 def read_ebe_file(path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
@@ -67,8 +123,10 @@ def read_ebe_file(path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
                 # Backward compatibility: files without p_plus_jump.
                 # Insert placeholder (NaN) right after p_plus.
                 values = values[:2] + [float("nan")] + values[2:]
-            if len(values) != len(columns):
-                raise ValueError(f"Unexpected column count in {path.name}")
+            if len(values) < len(columns):
+                values.extend([float("nan")] * (len(columns) - len(values)))
+            if len(values) > len(columns):
+                values = values[: len(columns)]
             rows.append(values)
     df = pd.DataFrame(rows, columns=columns)
     return df, meta
@@ -78,6 +136,8 @@ def welford_std_err(series: pd.Series) -> Tuple[float, float, float, float]:
     values = series.to_numpy(dtype=float)
     values = values[~np.isnan(values)]
     n = len(values)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 0.0
     mean = float(values.mean())
     std = float(values.std(ddof=1)) if n > 1 else 0.0
     err_mean = std / math.sqrt(n) if n > 1 else 0.0
@@ -227,12 +287,16 @@ def extract_fss(
 ) -> pd.DataFrame:
     assert value_kind in {"mean", "std"}
     records = []
+    L_values: List[int] = []
     for path in sorted(stats_paths):
         stats = read_stats_file(path)
         row_data = stats.loc[stats["row"] == row]
         if row_data.empty:
             continue
         N = extract_system_size(path.name)
+        radius = extract_ci_radius(path.name)
+        if radius is not None:
+            L_values.append(radius)
         if value_kind == "mean":
             value = float(row_data["mean"])
             error = float(row_data["err_mean"])
@@ -240,9 +304,19 @@ def extract_fss(
             value = float(row_data["std"])
             error = float(row_data["err_std"])
         records.append(
-            {"N": N, "value": value, "error": error, "source": path.name}
+            {
+                "N": N,
+                "value": value,
+                "error": error,
+                "source": path.name,
+                "L": radius,
+            }
         )
-    return pd.DataFrame(records).sort_values("N").reset_index(drop=True)
+    df = pd.DataFrame(records).sort_values("N").reset_index(drop=True)
+    uniq_L = [v for v in set(L_values) if v is not None]
+    if len(uniq_L) == 1:
+        df.attrs["L_value"] = uniq_L[0]
+    return df
 
 
 def extract_p1_minus_p2(
@@ -369,10 +443,23 @@ def compute_effective_exponents(fss: pd.DataFrame, window: int = 2) -> pd.DataFr
                 "exponent_err": slope_err,
             }
         )
-    return pd.DataFrame(rows)
+    eff = pd.DataFrame(rows)
+    inferred = _infer_L_value(fss)
+    if inferred is not None:
+        eff.attrs["L_value"] = inferred
+    return eff
 
 
-def plot_fss_with_fit(fss: pd.DataFrame, fit: Dict[str, float], title: str = "") -> None:
+def plot_fss_with_fit(
+    fss: pd.DataFrame,
+    fit: Dict[str, float],
+    title: str = "",
+    L_value: Optional[int] = None,
+    figure_name: Optional[str] = None,
+    show: bool = True,
+) -> Path:
+    if L_value is None:
+        L_value = _infer_L_value(fss)
     values = fss["value"].to_numpy(dtype=float)
     errors = fss["error"].to_numpy(dtype=float)
     using_abs = bool(np.any(values <= 0))
@@ -391,28 +478,68 @@ def plot_fss_with_fit(fss: pd.DataFrame, fit: Dict[str, float], title: str = "")
     ax.plot(xs, ys, label=f"fit: α={fit['alpha']:.4f}±{fit['alpha_err']:.4f}")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("N")
-    ylabel = "Observable" if not using_abs else "|Observable|"
+    ax.set_xlabel(r"$N$")
+    ylabel = r"$\mathrm{Observable}$" if not using_abs else r"$|\mathrm{Observable}|$"
     ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title + (" (|values| shown)" if using_abs else ""))
-    elif using_abs:
-        ax.set_title("|values| shown")
+    title_parts = [title] if title else []
+    if L_value is not None:
+        title_parts.append(f"L={L_value}")
+    combined_title = " | ".join(title_parts)
+    if using_abs and combined_title:
+        combined_title += " (|values| shown)"
+    elif using_abs and not combined_title:
+        combined_title = "|values| shown"
+    if combined_title:
+        ax.set_title(combined_title)
     ax.legend()
     ax.grid(True, which="both", ls="--", alpha=0.3)
-    plt.show()
+    fig_path = _save_figure(
+        fig,
+        figure_name
+        or (f"fss_L{L_value}" if L_value is not None else "fss"),
+        L_value=L_value,
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    print(f"Saved plot to {fig_path}")
+    return fig_path
 
 
-def plot_effective_exponent(eff: pd.DataFrame, title: str = "") -> None:
+def plot_effective_exponent(
+    eff: pd.DataFrame,
+    title: str = "",
+    L_value: Optional[int] = None,
+    figure_name: Optional[str] = None,
+    show: bool = True,
+) -> Path:
+    if L_value is None:
+        L_value = _infer_L_value(eff)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.errorbar(eff["N_geom"], eff["exponent"], yerr=eff["exponent_err"], fmt="o-")
     ax.set_xscale("log")
-    ax.set_xlabel("N (geometric mean)")
-    ax.set_ylabel("Effective exponent")
-    if title:
-        ax.set_title(title)
+    ax.set_xlabel(r"$N_{\mathrm{geom}}$")
+    ax.set_ylabel(r"$\text{Effective exponent}$")
+    title_parts = [title] if title else []
+    if L_value is not None:
+        title_parts.append(f"L={L_value}")
+    combined_title = " | ".join(title_parts)
+    if combined_title:
+        ax.set_title(combined_title)
     ax.grid(True, which="both", ls="--", alpha=0.3)
-    plt.show()
+    fig_path = _save_figure(
+        fig,
+        figure_name
+        or (f"eff_exp_L{L_value}" if L_value is not None else "eff_exp"),
+        L_value=L_value,
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    print(f"Saved plot to {fig_path}")
+    return fig_path
 
 
 def read_nr_file(path: Path) -> pd.DataFrame:
@@ -423,16 +550,18 @@ def read_nr_file(path: Path) -> pd.DataFrame:
             if not stripped or stripped.startswith("#"):
                 continue
             parts = stripped.split()
-            if len(parts) < 12:
+            if len(parts) < 3:
                 continue
             nodes_remaining = int(parts[0])
             frac_removed = float(parts[1])
             gc_mean = float(parts[2])
+            core_mean = float(parts[12]) if len(parts) >= 13 else math.nan
             rows.append(
                 {
                     "nodes_remaining": nodes_remaining,
                     "p": frac_removed,
                     "gc": gc_mean,
+                    "core": core_mean,
                 }
             )
     df = pd.DataFrame(rows)
@@ -450,8 +579,12 @@ def derive_output_prefix(prefix: str) -> str:
 
 
 def plot_giant_component_vs_p(
-    data_dir: Path, file_prefix: str, ci_radius_filter: Optional[int] = None
-) -> None:
+    data_dir: Path,
+    file_prefix: str,
+    ci_radius_filter: Optional[int] = None,
+    figure_name: Optional[str] = None,
+    show: bool = True,
+) -> Optional[Path]:
     output_prefix = derive_output_prefix(file_prefix)
     nr_pattern = f"{output_prefix}_NR_ER_*.dat"
     nr_files = sorted(data_dir.glob(nr_pattern))
@@ -475,14 +608,30 @@ def plot_giant_component_vs_p(
     df = read_nr_file(candidate)
     if df.empty:
         print("Selected file has no data:", candidate.name)
-        return
+        return None
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(df["p"], df["P_inf"], marker="o")
-    ax.set_xlabel("Fraction of removed nodes p")
-    ax.set_ylabel("P^∞ (giant component fraction)")
-    ax.set_title(f"Largest N={extract_system_size(candidate.name)} from {candidate.name}")
+    ax.plot(df["p"], df["P_inf"], marker="o", label=r"$P_\mathrm{GC}$")
+    if "core" in df.columns and df["core"].notna().any():
+        ax.plot(df["p"], df["core"], marker="s", label=r"$|C_2|$")
+    ax.set_xlabel(r"$p$")
+    ax.set_ylabel(r"$P^{\infty}$")
+    radius_label = f"L={radius}" if radius is not None else "L=NA"
+    N_val = extract_system_size(candidate.name)
+    ax.set_title(f"{radius_label} | N={N_val} giant component")
+    ax.legend()
     ax.grid(True, ls="--", alpha=0.3)
-    plt.show()
+    fig_path = _save_figure(
+        fig,
+        figure_name
+        or f"gc_L{radius if radius is not None else 'NA'}_N{N_val}",
+        L_value=radius,
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    print(f"Saved plot to {fig_path}")
+    return fig_path
 
 
 fit_power_law = weighted_log_fit
