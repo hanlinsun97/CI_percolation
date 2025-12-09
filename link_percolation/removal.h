@@ -30,6 +30,7 @@ void reset_link_percolation_result(LinkPercolationResult *result);
 
 int run_link_percolation(Graph *g, uint64_t rng_seed,
                          LinkPercolationResult *result,
-                         PseudoCriticalPoints *gc_ecp);
+                         PseudoCriticalPoints *gc_ecp,
+                         int use_static_core, int use_random_all);
 
 #endif // LINK_PERCOLATION_REMOVAL_H

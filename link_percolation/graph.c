@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static Graph *allocate_graph(int n, int m) {
   Graph *g = (Graph *)calloc(1, sizeof(Graph));
@@ -151,12 +152,49 @@ static inline size_t mix64(uint64_t z) {
   return (size_t)(z ^ (z >> 33));
 }
 
+static double rng_normal(rng_state_t *rng) {
+  // Box-Muller transform
+  double u1 = rng_double(rng);
+  double u2 = rng_double(rng);
+  if (u1 <= 1e-12)
+    u1 = 1e-12;
+  const double two_pi = 6.28318530717958647692;
+  return sqrt(-2.0 * log(u1)) * cos(two_pi * u2);
+}
+
+static long long sample_target_edges(int n, double c, rng_state_t *rng) {
+  double mu = c * (double)n / 2.0;
+  if (mu <= 0.0)
+    return 0;
+  double k;
+  if (mu < 30.0) {
+    // Knuth's algorithm for small means.
+    double L = exp(-mu);
+    double p = 1.0;
+    int k_int = 0;
+    do {
+      k_int++;
+      p *= rng_double(rng);
+    } while (p > L);
+    k = (double)(k_int - 1);
+  } else {
+    // Normal approximation for large mean.
+    double z = rng_normal(rng);
+    k = mu + sqrt(mu) * z;
+    if (k < 0.0)
+      k = 0.0;
+  }
+  long long target = (long long)llround(k);
+  long long max_edges = (long long)n * (long long)(n - 1) / 2LL;
+  if (target > max_edges)
+    target = max_edges;
+  return target;
+}
+
 Graph *generate_erdos_renyi_rng(int n, double c, rng_state_t *rng) {
   if (n <= 0)
     return NULL;
-  long long target = (long long)(c * (double)n / 2.0);
-  if (target <= 0)
-    target = 0;
+  long long target = sample_target_edges(n, c, rng);
   GraphEdge *edges = (target > 0)
                         ? (GraphEdge *)malloc((size_t)target * sizeof(GraphEdge))
                         : NULL;

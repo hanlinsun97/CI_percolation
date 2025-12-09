@@ -15,7 +15,7 @@
 #include <omp.h>
 #endif
 
-#define MILESTONE 10
+#define MILESTONE 100
 #define REPORT_TIME_INTERVAL 3600
 
 typedef enum { GRAPH_INPUT, GRAPH_ER } GraphMode;
@@ -32,6 +32,8 @@ static void print_usage(const char *prog) {
   printf("  -n_threads NUM      OpenMP threads (default auto)\n");
   printf("  -o PREFIX           Output prefix (default LR)\n");
   printf("  -r SEED             Random seed (default time)\n");
+  printf("  -static_core        Remove edges from the initial 2-core only (static mode)\n");
+  printf("  -random             Remove edges uniformly at random from all edges (bond percolation)\n");
 }
 
 static const char *path_basename(const char *path) {
@@ -49,6 +51,8 @@ int main(int argc, char **argv) {
   char output_prefix[128] = "LR";
   unsigned long seed = (unsigned long)time(NULL);
   int num_threads = 0;
+  int use_static_core = 0;
+  int use_random_all = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0) {
@@ -81,6 +85,10 @@ int main(int argc, char **argv) {
       seed = strtoul(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "-n_threads") == 0 && i + 1 < argc) {
       num_threads = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "-static_core") == 0) {
+      use_static_core = 1;
+    } else if (strcmp(argv[i], "-random") == 0) {
+      use_random_all = 1;
     } else {
       fprintf(stderr, "Unknown/incomplete option '%s'\n", argv[i]);
       print_usage(argv[0]);
@@ -113,7 +121,6 @@ int main(int argc, char **argv) {
 
   Graph *input_graph = NULL;
   int graph_nodes = 0;
-  int graph_edges = 0;
   if (mode == GRAPH_INPUT) {
     input_graph = read_graph_from_file(input_file);
     if (!input_graph) {
@@ -121,7 +128,6 @@ int main(int argc, char **argv) {
       return 1;
     }
     graph_nodes = input_graph->n;
-    graph_edges = input_graph->m;
   } else {
     graph_nodes = N;
   }
@@ -170,6 +176,8 @@ int main(int argc, char **argv) {
 
   volatile int error_flag = 0;
   int completed_runs = 0;
+  const char *debug_graph = getenv("LP_DEBUG_GRAPH");
+  const char *debug_run = getenv("LP_DEBUG_RUN");
 
 #ifdef _OPENMP
   double last_print_time = omp_get_wtime();
@@ -195,11 +203,14 @@ int main(int argc, char **argv) {
     LinkPercolationResult *thread_result = NULL;
 
     if (!local_gc || !local_small || !local_lambda || !local_comp ||
-        !local_cycles || !local_core || !thread_result) {
+        !local_cycles || !local_core) {
 #ifdef _OPENMP
 #pragma omp critical
 #endif
-      { error_flag = 1; }
+      {
+        fprintf(stderr, "Thread allocation failed (N=%d)\n", graph_nodes);
+        error_flag = 1;
+      }
     } else {
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic)
@@ -215,17 +226,27 @@ int main(int argc, char **argv) {
           rng_state_t graph_rng;
           uint64_t graph_seed =
               seed ^ (0xbf58476d1ce4e5b9ULL * (uint64_t)(graph_idx + 1));
+          rng_init(&graph_rng, graph_seed);
           owned_graph = generate_erdos_renyi_rng(N, avg_degree, &graph_rng);
           current_graph = owned_graph;
           if (!current_graph) {
 #ifdef _OPENMP
 #pragma omp critical
 #endif
-            { error_flag = 1; }
+            {
+              fprintf(stderr, "Graph generation failed for N=%d\n", N);
+              error_flag = 1;
+            }
             if (owned_graph)
               free_graph(owned_graph);
             continue;
           }
+        }
+
+        if (debug_graph) {
+          fprintf(stderr, "[LP] Graph %d/%d start (N=%d)\n", graph_idx + 1,
+                  M_graphs, current_graph->n);
+          fflush(stderr);
         }
 
         thread_result = create_link_percolation_result(current_graph->n,
@@ -234,34 +255,48 @@ int main(int argc, char **argv) {
 #ifdef _OPENMP
 #pragma omp critical
 #endif
-          { error_flag = 1; }
+          {
+            fprintf(stderr,
+                    "Allocation failed for thread_result (N=%d, m=%d)\n",
+                    current_graph->n, current_graph->m);
+            error_flag = 1;
+          }
         }
 
         for (int realization = 0;
              realization < M_realizations && !error_flag; realization++) {
           int run = graph_idx * M_realizations + realization;
+          if (debug_run) {
+            fprintf(stderr, "[LP]   Run %d start (graph %d)\n", run,
+                    graph_idx);
+            fflush(stderr);
+          }
           reset_link_percolation_result(thread_result);
           uint64_t run_seed =
               seed ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(run + 1));
           PseudoCriticalPoints gc_ecp;
           if (run_link_percolation(current_graph, run_seed, thread_result,
-                                   &gc_ecp) != 0) {
+                                   &gc_ecp, use_static_core, use_random_all) !=
+              0) {
 #ifdef _OPENMP
 #pragma omp critical
 #endif
-            { error_flag = 1; }
+            {
+              fprintf(stderr, "Run %d failed for N=%d\n", run,
+                      current_graph->n);
+              error_flag = 1;
+            }
             continue;
           }
 
           int sample_length = thread_result->series_length;
-          double norm_n = (double)current_graph->n;
           for (int i = 0; i < sample_length; i++) {
-            local_gc[i] = thread_result->giant_size[i] / norm_n;
+            local_gc[i] = thread_result->giant_size[i]; // absolute size
             local_small[i] = thread_result->avg_small_size[i];
             local_lambda[i] = thread_result->lambda1[i];
             local_comp[i] = (double)thread_result->num_components[i];
             local_cycles[i] = (double)thread_result->num_cycles[i];
-            local_core[i] = thread_result->core_size[i] / norm_n;
+            local_core[i] = thread_result->core_size[i]; // absolute size
           }
 
           EnhancedEBEData record = {0};
@@ -292,6 +327,15 @@ int main(int argc, char **argv) {
           record.core_drop = thread_result->core_drop;
           record.core_size_star = thread_result->core_size_at_star;
           record.core_zero_p = thread_result->core_zero_p;
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+          if (debug_run) {
+            fprintf(stderr, "[LP]   Run %d finish (graph %d)\n", run,
+                    graph_idx);
+            fflush(stderr);
+          }
 
 #ifdef _OPENMP
 #pragma omp critical
@@ -335,6 +379,12 @@ int main(int argc, char **argv) {
           thread_result = NULL;
         }
 
+        if (debug_graph) {
+          fprintf(stderr, "[LP] Graph %d/%d finish (N=%d)\n", graph_idx + 1,
+                  M_graphs, current_graph->n);
+          fflush(stderr);
+        }
+
         if (mode == GRAPH_ER && owned_graph) {
           free_graph(owned_graph);
         }
@@ -351,6 +401,7 @@ int main(int argc, char **argv) {
   }
 
   if (error_flag) {
+    fprintf(stderr, "link_percolation terminated with errors\n");
     if (input_graph)
       free_graph(input_graph);
     ebe_writer_abort(ebe_writer);

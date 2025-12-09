@@ -198,6 +198,7 @@ void ebe_writer_abort(EBEWriter *writer) {
     return;
   if (writer->file) {
     fclose(writer->file);
+    writer->file = NULL;
     if (writer->path) {
       remove(writer->path);
     }

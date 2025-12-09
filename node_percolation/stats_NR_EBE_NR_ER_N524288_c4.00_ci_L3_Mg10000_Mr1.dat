@@ -1,7 +1,7 @@
 # Statistical Analysis Results
 # Input file: NR_EBE_NR_ER_N524288_c4.00_ci_L3_Mg10000_Mr1.dat
 # Number of runs: 10000
-# Number of columns: 24
+# Number of columns: 28
 #
 # Standard error of std dev uses exact formula: SE(σ) = σ * sqrt[(κ + 2) / (4M)]
 #
@@ -32,6 +32,10 @@
  22      8.33350000      0.07287289      7.28728950      0.31966357
  23      0.23280592      0.00000205      0.00020450      0.00000144
  24      0.24850600      0.00001029      0.00102864      0.00000833
+ 25      0.00000000      0.00000000      0.00000000      0.00000000
+ 26      0.00000000      0.00000000      0.00000000      0.00000000
+ 27      0.00000000      0.00000000      0.00000000      0.00000000
+ 28      0.00000000      0.00000000      0.00000000      0.00000000
 #
 # Summary:
-# Successfully processed 10000 runs with 24 columns each
+# Successfully processed 10000 runs with 28 columns each

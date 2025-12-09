@@ -482,8 +482,6 @@ def plot_fss_with_fit(
     ylabel = r"$\mathrm{Observable}$" if not using_abs else r"$|\mathrm{Observable}|$"
     ax.set_ylabel(ylabel)
     title_parts = [title] if title else []
-    if L_value is not None:
-        title_parts.append(f"L={L_value}")
     combined_title = " | ".join(title_parts)
     if using_abs and combined_title:
         combined_title += " (|values| shown)"
@@ -522,8 +520,6 @@ def plot_effective_exponent(
     ax.set_xlabel(r"$N_{\mathrm{geom}}$")
     ax.set_ylabel(r"$\text{Effective exponent}$")
     title_parts = [title] if title else []
-    if L_value is not None:
-        title_parts.append(f"L={L_value}")
     combined_title = " | ".join(title_parts)
     if combined_title:
         ax.set_title(combined_title)
@@ -615,9 +611,8 @@ def plot_giant_component_vs_p(
         ax.plot(df["p"], df["core"], marker="s", label=r"$|C_2|$")
     ax.set_xlabel(r"$p$")
     ax.set_ylabel(r"$P^{\infty}$")
-    radius_label = f"L={radius}" if radius is not None else "L=NA"
     N_val = extract_system_size(candidate.name)
-    ax.set_title(f"{radius_label} | N={N_val} giant component")
+    ax.set_title(f"N={N_val} giant component")
     ax.legend()
     ax.grid(True, ls="--", alpha=0.3)
     fig_path = _save_figure(

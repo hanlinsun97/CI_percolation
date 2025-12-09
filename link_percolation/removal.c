@@ -6,6 +6,99 @@
 #include <string.h>
 
 typedef struct {
+  int n;
+  int *parent;
+  int *size;
+  int num_components;
+  int largest_component;
+  int active_edges;
+  long long sum_s_squared;
+} UF;
+
+typedef struct {
+  double giant;
+  double avg_small;
+  int num_components;
+  int num_cycles;
+} SimpleSnap;
+
+static UF *uf_create(int n) {
+  UF *uf = (UF *)calloc(1, sizeof(UF));
+  if (!uf)
+    return NULL;
+  uf->parent = (int *)malloc((size_t)n * sizeof(int));
+  uf->size = (int *)malloc((size_t)n * sizeof(int));
+  if (!uf->parent || !uf->size) {
+    free(uf->parent);
+    free(uf->size);
+    free(uf);
+    return NULL;
+  }
+  uf->n = n;
+  uf->num_components = n;
+  uf->largest_component = 1;
+  uf->active_edges = 0;
+  uf->sum_s_squared = (long long)n; // n * 1^2
+  for (int i = 0; i < n; i++) {
+    uf->parent[i] = i;
+    uf->size[i] = 1;
+  }
+  return uf;
+}
+
+static void uf_free(UF *uf) {
+  if (!uf)
+    return;
+  free(uf->parent);
+  free(uf->size);
+  free(uf);
+}
+
+static int uf_find(UF *uf, int x) {
+  while (uf->parent[x] != x) {
+    uf->parent[x] = uf->parent[uf->parent[x]];
+    x = uf->parent[x];
+  }
+  return x;
+}
+
+static void uf_union(UF *uf, int a, int b) {
+  int ra = uf_find(uf, a);
+  int rb = uf_find(uf, b);
+  if (ra == rb)
+    return;
+  if (uf->size[ra] < uf->size[rb]) {
+    int tmp = ra;
+    ra = rb;
+    rb = tmp;
+  }
+  uf->parent[rb] = ra;
+  long long sa = uf->size[ra];
+  long long sb = uf->size[rb];
+  uf->sum_s_squared -= sa * sa + sb * sb;
+  uf->size[ra] += uf->size[rb];
+  long long snew = uf->size[ra];
+  uf->sum_s_squared += snew * snew;
+  uf->num_components--;
+  if (uf->size[ra] > uf->largest_component) {
+    uf->largest_component = uf->size[ra];
+  }
+}
+
+static double uf_avg_small(const UF *uf) {
+  if (uf->n <= 0)
+    return 0.0;
+  int giant = uf->largest_component;
+  int nodes_in_small = uf->n - giant;
+  if (nodes_in_small <= 0)
+    return 0.0;
+  long long small_sq = uf->sum_s_squared - (long long)giant * (long long)giant;
+  if (small_sq <= 0)
+    return 0.0;
+  return (double)small_sq / (double)nodes_in_small;
+}
+
+typedef struct {
   int u;
   int v;
   unsigned char active;
@@ -205,7 +298,8 @@ static void sample_core_series(LinkPercolationResult *res, int removed_edges,
 
 int run_link_percolation(Graph *g, uint64_t rng_seed,
                          LinkPercolationResult *result,
-                         PseudoCriticalPoints *gc_ecp) {
+                         PseudoCriticalPoints *gc_ecp,
+                         int use_static_core, int use_random_all) {
   const int n = g->n;
   const int m = g->m;
   if (m <= 0)
@@ -267,7 +361,23 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   int core_nodes = n;
   int core_edge_count = 0;
   // Prune initial 2-core.
+  long long safety_core_prune = 0;
+  long long max_core_prune = 10LL * n + 100000;
   while (qhead < qtail) {
+    if (++safety_core_prune > max_core_prune) {
+      fprintf(stderr, "Core prune safety hit (N=%d, m=%d, q=%d)\n", n, m,
+              qtail - qhead);
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      return -1;
+    }
     int node = queue[qhead++];
     in_queue[node] = 0;
     remove_core_node(node, edges, incident_offsets, incident_edges, in_core,
@@ -283,8 +393,68 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
     }
   }
 
+  // Selection pools:
+  // - adaptive: use current core_edges_arr/core_edge_count
+  // - static: frozen copy of initial core edges
+  // - random_all: all edges at start
+  int *static_core_edges = NULL;
+  int static_remaining = 0;
+  int static_mode = (use_static_core && core_edge_count > 0) ? 1 : 0;
+  if (static_mode) {
+    static_remaining = core_edge_count;
+    static_core_edges = (int *)malloc((size_t)static_remaining * sizeof(int));
+    if (!static_core_edges) {
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      return -1;
+    }
+    memcpy(static_core_edges, core_edges_arr,
+           (size_t)static_remaining * sizeof(int));
+  }
+
+  int *all_edges_pool = NULL;
+  int all_remaining = 0;
+  int random_mode = use_random_all ? 1 : 0;
+  if (random_mode) {
+    all_remaining = m;
+    all_edges_pool = (int *)malloc((size_t)all_remaining * sizeof(int));
+    if (!all_edges_pool) {
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      free(static_core_edges);
+      return -1;
+    }
+    for (int i = 0; i < m; i++) {
+      all_edges_pool[i] = i;
+    }
+  }
+
   rng_state_t rng_local;
   rng_init(&rng_local, rng_seed);
+
+  if (random_mode) {
+    // Shuffle once to ensure random order independent of enumeration.
+    for (int i = m - 1; i > 0; i--) {
+      int r = (int)rng_range(&rng_local, (uint32_t)(i + 1));
+      int tmp = all_edges_pool[i];
+      all_edges_pool[i] = all_edges_pool[r];
+      all_edges_pool[r] = tmp;
+    }
+  }
 
   reset_link_percolation_result(result);
 
@@ -292,15 +462,78 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   double prev_core_size = (double)core_nodes;
   int removed_edges = 0;
 
-  while (core_edge_count > 0) {
-    int idx = rng_range(&rng_local, (uint32_t)core_edge_count);
-    int edge_id = core_edges_arr[idx];
-    if (!edges[edge_id].active || !edges[edge_id].in_core) {
+  long long safety_core_loop = 0;
+  long long max_core_loop = 10LL * m + 100000;
+  while (1) {
+    int active_pool = 0;
+    if (random_mode) {
+      active_pool = all_remaining;
+    } else if (static_mode) {
+      active_pool = static_remaining;
+    } else {
+      active_pool = core_edge_count;
+    }
+    if (active_pool <= 0)
+      break;
+    if (++safety_core_loop > max_core_loop) {
+      fprintf(stderr, "Core loop safety hit (N=%d, m=%d, core_edges=%d)\n", n,
+              m, core_edge_count);
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      return -1;
+    }
+    int edge_id = -1;
+    if (random_mode) {
+      while (all_remaining > 0 && edge_id < 0) {
+        int idx = (int)rng_range(&rng_local, (uint32_t)all_remaining);
+        int candidate = all_edges_pool[idx];
+        if (!edges[candidate].active) {
+          all_edges_pool[idx] = all_edges_pool[all_remaining - 1];
+          all_remaining--;
+          continue;
+        }
+        edge_id = candidate;
+        all_edges_pool[idx] = all_edges_pool[all_remaining - 1];
+        all_remaining--;
+      }
+      if (edge_id < 0) {
+        break;
+      }
+    } else if (static_mode) {
+      // Pick from the original core edge list, skipping any already inactive.
+      while (static_remaining > 0 && edge_id < 0) {
+        int idx = (int)rng_range(&rng_local, (uint32_t)static_remaining);
+        int candidate = static_core_edges[idx];
+        if (!edges[candidate].active) {
+          static_core_edges[idx] = static_core_edges[static_remaining - 1];
+          static_remaining--;
+          continue;
+        }
+        edge_id = candidate;
+        static_core_edges[idx] = static_core_edges[static_remaining - 1];
+        static_remaining--;
+      }
+      if (edge_id < 0) {
+        break;
+      }
+    } else {
+      int idx = rng_range(&rng_local, (uint32_t)core_edge_count);
+      edge_id = core_edges_arr[idx];
+    }
+    if (!edges[edge_id].active) {
       core_edge_remove(edge_id, edges, core_edges_arr, core_pos,
                        &core_edge_count);
       continue;
     }
 
+    // Physically remove only the chosen edge.
     edges[edge_id].active = 0;
     core_edge_remove(edge_id, edges, core_edges_arr, core_pos,
                      &core_edge_count);
@@ -344,24 +577,46 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   }
 
   // Remove remaining (tree) edges uniformly at random.
-  int remaining = 0;
-  for (int e = 0; e < m; e++) {
-    if (edges[e].active) {
-      core_edges_arr[remaining++] = e;
+  if (!random_mode) {
+    long long safety_tree_loop = 0;
+    int remaining = 0;
+    for (int e = 0; e < m; e++) {
+      if (edges[e].active) {
+        core_edges_arr[remaining++] = e;
+      }
     }
-  }
-  for (int i = remaining - 1; i >= 0; i--) {
-    int r = (int)rng_range(&rng_local, (uint32_t)(i + 1));
-    int chosen = core_edges_arr[r];
-    core_edges_arr[r] = core_edges_arr[i];
-    core_edges_arr[i] = chosen;
-    edges[chosen].active = 0;
-    result->removal_order[removed_edges++] = chosen;
-    sample_core_series(result, removed_edges, 0);
+    long long max_tree_loop = 10LL * remaining + 100000;
+    for (int i = remaining - 1; i >= 0; i--) {
+      if (++safety_tree_loop > max_tree_loop) {
+        fprintf(stderr,
+                "Tree loop safety hit (N=%d, m=%d, remaining=%d, i=%d)\n", n,
+                m, remaining, i);
+        free(incident_offsets);
+        free(incident_edges);
+        free(edges);
+        free(in_core);
+        free(in_queue);
+        free(core_degree);
+        free(queue);
+        free(core_edges_arr);
+        free(core_pos);
+        return -1;
+      }
+      int r = (int)rng_range(&rng_local, (uint32_t)(i + 1));
+      int chosen = core_edges_arr[r];
+      core_edges_arr[r] = core_edges_arr[i];
+      core_edges_arr[i] = chosen;
+      edges[chosen].active = 0;
+      result->removal_order[removed_edges++] = chosen;
+      sample_core_series(result, removed_edges, 0);
+    }
   }
 
   result->removal_length = removed_edges;
   if (removed_edges != m) {
+    fprintf(stderr,
+            "Error: removal order length mismatch (removed=%d, m=%d)\n",
+            removed_edges, m);
     free(incident_offsets);
     free(incident_edges);
     free(edges);
@@ -376,16 +631,32 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
 
   // Forward-fill any unsampled core sizes to avoid artificial zeros.
   double last_core = result->core_size[0];
+  double zero_p = result->core_zero_p;
   for (int i = 0; i < result->series_length; i++) {
-    if (result->core_size[i] <= 0.0 && i > 0) {
-      result->core_size[i] = last_core;
+    double p_here = (result->series_length <= 1)
+                        ? 1.0
+                        : (double)i / (double)(result->series_length - 1);
+    if (result->core_size[i] <= 0.0) {
+      if (zero_p >= 0.0 && p_here >= zero_p) {
+        result->core_size[i] = 0.0; // past core extinction, stay zero
+        last_core = 0.0;
+      } else if (i > 0) {
+        result->core_size[i] = last_core; // fill early sparse samples
+      }
     } else {
       last_core = result->core_size[i];
     }
   }
+  // Ensure final sample at p=1 reflects empty 2-core.
+  if (result->series_length > 0) {
+    result->core_size[result->series_length - 1] = 0.0;
+  }
 
-  reconstruct_with_newman_ziff(g, result->removal_order, m, result, gc_ecp);
+  reconstruct_with_newman_ziff(g, result->removal_order, result->removal_length,
+                               result, gc_ecp);
 
+  free(static_core_edges);
+  free(all_edges_pool);
   free(incident_offsets);
   free(incident_edges);
   free(edges);
