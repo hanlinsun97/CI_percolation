@@ -163,22 +163,31 @@ void reconstruct_with_newman_ziff(Graph *g, const int *removal_order,
     return;
   }
 
-  unsigned char sampled[NR_SERIES_LENGTH] = {0};
+  unsigned char *sampled =
+      (unsigned char *)calloc((size_t)result->series_length, sizeof(unsigned char));
+  if (!sampled) {
+    nzuf_free(uf);
+    free(edges);
+    return;
+  }
 
   Snapshot snap = {0};
   Snapshot p_plus_snap = {0}, q_plus_snap = {0}, q_zero_snap = {0},
            q_minus_snap = {0};
+  Snapshot prev_snap = {0};
   int p_plus_idx = 0, q_plus_idx = 0, q_zero_idx = 0, q_minus_idx = 0;
   int p1_idx = -1, p2_idx = -1;
   const int threshold_p1 = n / 2;
   const double threshold_p2 = sqrt((double)n);
 
-  double prev_gc = 0.0;
   double prev_small = 0.0;
   double max_gc_jump = 0.0;
   double max_positive_small = 0.0;
   double max_negative_small = 0.0;
   double max_small_size = 0.0;
+
+  // Initialize "previous" snapshot for jump bookkeeping: empty graph state.
+  fill_snapshot(&prev_snap, uf, nzuf_avg_small_size(uf));
 
   const int samples = result->series_length - 1;
   int sample_idx0 = samples;
@@ -205,11 +214,13 @@ void reconstruct_with_newman_ziff(Graph *g, const int *removal_order,
     double avg_small = nzuf_avg_small_size(uf);
     fill_snapshot(&snap, uf, avg_small);
 
-    double gc_jump = giant - prev_gc;
+    double gc_jump = snap.giant - prev_snap.giant;
     if (gc_jump > max_gc_jump) {
       max_gc_jump = gc_jump;
       p_plus_idx = idx;
-      p_plus_snap = snap;
+      // Store the state BEFORE this edge is added (i.e., AFTER the corresponding
+      // edge is removed in the forward process).
+      p_plus_snap = prev_snap;
     }
 
     double small_jump = avg_small - prev_small;
@@ -251,17 +262,42 @@ void reconstruct_with_newman_ziff(Graph *g, const int *removal_order,
       sampled[sample_idx] = 1;
     }
 
-    prev_gc = giant;
     prev_small = avg_small;
+    prev_snap = snap;
   }
 
   nzuf_free(uf);
   free(edges);
 
+  // Fill any unsampled indices (can happen when series_length > m + 1).
+  int last_filled = samples;
+  for (int i = samples; i >= 0; i--) {
+    if (sampled[i]) {
+      last_filled = i;
+      continue;
+    }
+    result->giant_size[i] = result->giant_size[last_filled];
+    result->avg_small_size[i] = result->avg_small_size[last_filled];
+    result->num_components[i] = result->num_components[last_filled];
+    result->num_cycles[i] = result->num_cycles[last_filled];
+    result->lambda1[i] = result->lambda1[last_filled];
+  }
+
+  free(sampled);
+
   if (!ecp)
     return;
 
-  ecp->p_plus = 1.0 - (double)p_plus_idx / (double)m;
+  // Map NZ reconstruction index (adding an edge) to the forward removal
+  // pseudocritical point AFTER the corresponding largest GC drop.
+  // In NZ, the jump is from prev_snap -> snap when adding the edge at idx.
+  // The forward post-drop state corresponds to prev_snap, which has removed
+  // fraction: 1 - (idx - 1)/m.
+  if (p_plus_idx > 0) {
+    ecp->p_plus = 1.0 - (double)(p_plus_idx - 1) / (double)m;
+  } else {
+    ecp->p_plus = 1.0;
+  }
   ecp->p_plus_jump = max_gc_jump / (double)n;
   ecp->q_plus = 1.0 - (double)q_plus_idx / (double)m;
   ecp->q_zero = 1.0 - (double)q_zero_idx / (double)m;

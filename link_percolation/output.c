@@ -29,14 +29,25 @@ void save_averaged_results(const char *filename, int n, int m,
     return;
   }
 
-  int series_length = NR_SERIES_LENGTH;
-  double *gc_std = (double *)malloc((size_t)series_length * sizeof(double));
-  double *small_std = (double *)malloc((size_t)series_length * sizeof(double));
-  double *lambda_std = (double *)malloc((size_t)series_length * sizeof(double));
-  double *comp_std = (double *)malloc((size_t)series_length * sizeof(double));
-  double *cycles_std =
-      (double *)malloc((size_t)series_length * sizeof(double));
-  double *core_std = (double *)malloc((size_t)series_length * sizeof(double));
+  size_t series_length = gc_stats ? gc_stats->length : 0;
+  if (series_length < 2 || !small_stats || !lambda_stats || !comp_stats ||
+      !cycles_stats || !core_stats ||
+      small_stats->length != series_length || lambda_stats->length != series_length ||
+      comp_stats->length != series_length || cycles_stats->length != series_length ||
+      core_stats->length != series_length) {
+    fprintf(stderr,
+            "Error: statistics buffers have inconsistent lengths for %s\n",
+            filename);
+    fclose(f);
+    return;
+  }
+
+  double *gc_std = (double *)malloc(series_length * sizeof(double));
+  double *small_std = (double *)malloc(series_length * sizeof(double));
+  double *lambda_std = (double *)malloc(series_length * sizeof(double));
+  double *comp_std = (double *)malloc(series_length * sizeof(double));
+  double *cycles_std = (double *)malloc(series_length * sizeof(double));
+  double *core_std = (double *)malloc(series_length * sizeof(double));
 
   online_stats_get_std(gc_stats, gc_std);
   online_stats_get_std(small_stats, small_std);
@@ -49,6 +60,7 @@ void save_averaged_results(const char *filename, int n, int m,
   fprintf(f, "# N=%d M=%d\n", n, m);
   fprintf(f, "# M_graphs=%d M_realizations=%d Total_runs=%d\n", M_graphs,
           M_realizations, M_graphs * M_realizations);
+  fprintf(f, "# Output_samples=%zu\n", series_length - 1);
   fprintf(f, "# Columns:\n");
   fprintf(f, "#(1) edges_remaining (2) frac_removed\n");
   fprintf(f, "#(3) gc_mean (4) gc_std\n");
@@ -58,27 +70,24 @@ void save_averaged_results(const char *filename, int n, int m,
   fprintf(f, "#(11) lambda1_mean (12) lambda1_std\n");
   fprintf(f, "#(13) core_mean (14) core_std\n");
 
-  const int samples = NR_OUTPUT_SAMPLES;
-  for (int s = 0; s <= samples; s++) {
-    double frac_removed = (double)s / samples;
+  const size_t samples = series_length - 1;
+  for (size_t s = 0; s <= samples; s++) {
+    double frac_removed = (double)s / (double)samples;
     int removed = (int)lround(frac_removed * m);
     if (removed > m)
       removed = m;
     int edges_remaining = m - removed;
     fprintf(f, "%d %.8f ", edges_remaining, frac_removed);
-    int sample_index = s;
-    fprintf(f, "%.8f %.8f ", gc_stats->mean[sample_index],
-            gc_std[sample_index]);
+    size_t sample_index = s;
+    fprintf(f, "%.8f %.8f ", gc_stats->mean[sample_index], gc_std[sample_index]);
     fprintf(f, "%.8f %.8f ", small_stats->mean[sample_index],
             small_std[sample_index]);
-    fprintf(f, "%.8f %.8f ", comp_stats->mean[sample_index],
-            comp_std[sample_index]);
+    fprintf(f, "%.8f %.8f ", comp_stats->mean[sample_index], comp_std[sample_index]);
     fprintf(f, "%.8f %.8f ", cycles_stats->mean[sample_index],
             cycles_std[sample_index]);
     fprintf(f, "%.8f %.8f ", lambda_stats->mean[sample_index],
             lambda_std[sample_index]);
-    fprintf(f, "%.8f %.8f\n", core_stats->mean[sample_index],
-            core_std[sample_index]);
+    fprintf(f, "%.8f %.8f\n", core_stats->mean[sample_index], core_std[sample_index]);
   }
 
   free(gc_std);

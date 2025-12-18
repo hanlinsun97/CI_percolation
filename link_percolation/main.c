@@ -5,6 +5,7 @@
 #include "stats.h"
 #include <math.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +31,16 @@ static void print_usage(const char *prog) {
   printf("  -M_graphs NUM       Number of graphs (default 1)\n");
   printf("  -M_realizations NUM Realizations per graph (default 1)\n");
   printf("  -n_threads NUM      OpenMP threads (default auto)\n");
+  printf("  -samples NUM        Output samples in [0,1] (0=full grid, default %d)\n",
+         DEFAULT_OUTPUT_SAMPLES);
   printf("  -o PREFIX           Output prefix (default LR)\n");
   printf("  -r SEED             Random seed (default time)\n");
   printf("  -static_core        Remove edges from the initial 2-core only (static mode)\n");
+  printf("  -adaptive_biased    Adaptive 2-core removal biased by max(k_i + k_j)\n");
+  printf("  -static_biased      Static 2-core removal biased by max(k_i + k_j) in initial 2-core\n");
   printf("  -random             Remove edges uniformly at random from all edges (bond percolation)\n");
+  printf("  -random_biased      Remove edges from all edges biased by max(k_i + k_j) using ORIGINAL degrees\n");
+  printf("  -random_biased_adaptive Remove edges from all edges biased by max(k_i + k_j) using CURRENT degrees\n");
 }
 
 static const char *path_basename(const char *path) {
@@ -51,8 +58,13 @@ int main(int argc, char **argv) {
   char output_prefix[128] = "LR";
   unsigned long seed = (unsigned long)time(NULL);
   int num_threads = 0;
+  int output_samples = DEFAULT_OUTPUT_SAMPLES;
+  int output_samples_full = 0;
   int use_static_core = 0;
   int use_random_all = 0;
+  int use_biased_selection = 0;
+  int use_random_biased_original = 0;
+  int use_random_biased_adaptive = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-h") == 0) {
@@ -85,10 +97,76 @@ int main(int argc, char **argv) {
       seed = strtoul(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "-n_threads") == 0 && i + 1 < argc) {
       num_threads = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "-samples") == 0 && i + 1 < argc) {
+      output_samples = atoi(argv[++i]);
+      if (output_samples < 0) {
+        fprintf(stderr, "-samples must be >= 0\n");
+        return 1;
+      }
+      if (output_samples == 0) {
+        output_samples_full = 1;
+      } else if (output_samples >= INT_MAX) {
+        fprintf(stderr, "-samples is too large\n");
+        return 1;
+      }
     } else if (strcmp(argv[i], "-static_core") == 0) {
+      if (use_random_all || use_biased_selection || use_random_biased_original ||
+          use_random_biased_adaptive) {
+        fprintf(stderr,
+                "-static_core is incompatible with -random/-*_biased/-random_biased*\n");
+        return 1;
+      }
+      use_static_core = 1;
+    } else if (strcmp(argv[i], "-adaptive_biased") == 0) {
+      if (use_random_all || use_static_core || use_random_biased_original ||
+          use_random_biased_adaptive) {
+        fprintf(stderr,
+                "-adaptive_biased is incompatible with -random/-static_core/-random_biased*\n");
+        return 1;
+      }
+      if (use_biased_selection && use_static_core) {
+        fprintf(stderr, "Conflicting biased modes\n");
+        return 1;
+      }
+      use_biased_selection = 1;
+      use_static_core = 0;
+    } else if (strcmp(argv[i], "-static_biased") == 0) {
+      if (use_random_all || use_random_biased_original ||
+          use_random_biased_adaptive) {
+        fprintf(stderr,
+                "-static_biased is incompatible with -random/-random_biased*\n");
+        return 1;
+      }
+      if (use_biased_selection && !use_static_core) {
+        fprintf(stderr, "Conflicting biased modes\n");
+        return 1;
+      }
+      use_biased_selection = 1;
       use_static_core = 1;
     } else if (strcmp(argv[i], "-random") == 0) {
+      if (use_static_core || use_biased_selection || use_random_biased_original ||
+          use_random_biased_adaptive) {
+        fprintf(stderr,
+                "-random is incompatible with -static_core/-*_biased/-random_biased*\n");
+        return 1;
+      }
       use_random_all = 1;
+    } else if (strcmp(argv[i], "-random_biased") == 0) {
+      if (use_static_core || use_biased_selection || use_random_all ||
+          use_random_biased_adaptive) {
+        fprintf(stderr,
+                "-random_biased is incompatible with -static_core/-*_biased/-random/-random_biased_adaptive\n");
+        return 1;
+      }
+      use_random_biased_original = 1;
+    } else if (strcmp(argv[i], "-random_biased_adaptive") == 0) {
+      if (use_static_core || use_biased_selection || use_random_all ||
+          use_random_biased_original) {
+        fprintf(stderr,
+                "-random_biased_adaptive is incompatible with -static_core/-*_biased/-random/-random_biased\n");
+        return 1;
+      }
+      use_random_biased_adaptive = 1;
     } else {
       fprintf(stderr, "Unknown/incomplete option '%s'\n", argv[i]);
       print_usage(argv[0]);
@@ -132,7 +210,27 @@ int main(int argc, char **argv) {
     graph_nodes = N;
   }
 
-  const int series_length = NR_SERIES_LENGTH;
+  int output_m_ref = (mode == GRAPH_INPUT && input_graph)
+                         ? input_graph->m
+                         : (int)lround(avg_degree * (double)graph_nodes / 2.0);
+  if (output_m_ref <= 0) {
+    fprintf(stderr, "Invalid output M reference (M=%d)\n", output_m_ref);
+    return 1;
+  }
+  if (output_samples_full) {
+    output_samples = output_m_ref;
+  }
+  if (!output_samples_full && output_samples > output_m_ref) {
+    fprintf(stderr,
+            "Error: -samples (%d) cannot exceed M (%d). Use -samples 0 for the full grid.\n",
+            output_samples, output_m_ref);
+    return 1;
+  }
+  if (output_samples >= INT_MAX - 1) {
+    fprintf(stderr, "-samples is too large\n");
+    return 1;
+  }
+  const int series_length = output_samples + 1;
   OnlineStats *gc_stats = create_online_stats(series_length);
   OnlineStats *small_stats = create_online_stats(series_length);
   OnlineStats *lambda_stats = create_online_stats(series_length);
@@ -249,8 +347,8 @@ int main(int argc, char **argv) {
           fflush(stderr);
         }
 
-        thread_result = create_link_percolation_result(current_graph->n,
-                                                       current_graph->m);
+        thread_result = create_link_percolation_result(
+            current_graph->n, current_graph->m, series_length);
         if (!thread_result) {
 #ifdef _OPENMP
 #pragma omp critical
@@ -276,7 +374,10 @@ int main(int argc, char **argv) {
               seed ^ (0x9e3779b97f4a7c15ULL * (uint64_t)(run + 1));
           PseudoCriticalPoints gc_ecp;
           if (run_link_percolation(current_graph, run_seed, thread_result,
-                                   &gc_ecp, use_static_core, use_random_all) !=
+                                   &gc_ecp, use_static_core, use_random_all,
+                                   use_biased_selection,
+                                   use_random_biased_original,
+                                   use_random_biased_adaptive) !=
               0) {
 #ifdef _OPENMP
 #pragma omp critical
@@ -415,10 +516,7 @@ int main(int argc, char **argv) {
   }
 
   save_averaged_results(averaged_file, graph_nodes,
-                        (mode == GRAPH_INPUT && input_graph) ? input_graph->m
-                                                             : (int)(avg_degree *
-                                                                     graph_nodes /
-                                                                     2.0),
+                        output_m_ref,
                         M_graphs, M_realizations, gc_stats, small_stats,
                         lambda_stats, comp_stats, cycles_stats, core_stats);
   ebe_writer_finish(ebe_writer);

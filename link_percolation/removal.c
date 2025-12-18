@@ -162,12 +162,15 @@ static EdgeState *build_edge_list(const Graph *g, int *incident_edges,
   return edges;
 }
 
-LinkPercolationResult *create_link_percolation_result(int n, int m) {
+LinkPercolationResult *create_link_percolation_result(int n, int m,
+                                                      int series_length) {
+  if (n <= 0 || m < 0 || series_length < 2)
+    return NULL;
   LinkPercolationResult *res =
       (LinkPercolationResult *)calloc(1, sizeof(LinkPercolationResult));
   if (!res)
     return NULL;
-  const int len = NR_SERIES_LENGTH;
+  const int len = series_length;
   res->n = n;
   res->m = m;
   res->series_length = len;
@@ -228,10 +231,13 @@ static inline int other_endpoint(const EdgeState *edges, int edge_id, int u) {
 }
 
 static void core_edge_remove(int edge_id, EdgeState *edges, int *core_edges,
-                             int *core_pos, int *core_edge_count) {
+                             int *core_pos, int *core_edge_count,
+                             int maintain_list) {
   if (!edges[edge_id].in_core)
     return;
   edges[edge_id].in_core = 0;
+  if (!maintain_list)
+    return;
   int last_idx = *core_edge_count - 1;
   int pos = core_pos[edge_id];
   if (pos < 0)
@@ -243,6 +249,101 @@ static void core_edge_remove(int edge_id, EdgeState *edges, int *core_edges,
   }
   (*core_edge_count)--;
   core_pos[edge_id] = -1;
+}
+
+static inline int heap_better(int score_a, int edge_a, int score_b, int edge_b) {
+  if (score_a != score_b)
+    return score_a > score_b;
+  // Deterministic tie-break to avoid dependence on enumeration order.
+  return edge_a < edge_b;
+}
+
+static void heap_swap(int *heap_edges, int *heap_scores, int i, int j) {
+  int te = heap_edges[i];
+  heap_edges[i] = heap_edges[j];
+  heap_edges[j] = te;
+  int ts = heap_scores[i];
+  heap_scores[i] = heap_scores[j];
+  heap_scores[j] = ts;
+}
+
+static void heap_sift_down(int *heap_edges, int *heap_scores, int size,
+                           int idx) {
+  while (1) {
+    int left = 2 * idx + 1;
+    int right = left + 1;
+    int best = idx;
+    if (left < size &&
+        heap_better(heap_scores[left], heap_edges[left], heap_scores[best],
+                    heap_edges[best])) {
+      best = left;
+    }
+    if (right < size &&
+        heap_better(heap_scores[right], heap_edges[right], heap_scores[best],
+                    heap_edges[best])) {
+      best = right;
+    }
+    if (best == idx)
+      break;
+    heap_swap(heap_edges, heap_scores, idx, best);
+    idx = best;
+  }
+}
+
+static void heap_sift_up(int *heap_edges, int *heap_scores, int idx) {
+  while (idx > 0) {
+    int parent = (idx - 1) / 2;
+    if (heap_better(heap_scores[parent], heap_edges[parent], heap_scores[idx],
+                    heap_edges[idx])) {
+      break;
+    }
+    heap_swap(heap_edges, heap_scores, parent, idx);
+    idx = parent;
+  }
+}
+
+static void heap_build(int *heap_edges, int *heap_scores, int size) {
+  for (int i = size / 2 - 1; i >= 0; i--) {
+    heap_sift_down(heap_edges, heap_scores, size, i);
+  }
+}
+
+static int heap_pop(int *heap_edges, int *heap_scores, int *size, int *edge_id,
+                    int *score) {
+  if (*size <= 0)
+    return 0;
+  *edge_id = heap_edges[0];
+  *score = heap_scores[0];
+  (*size)--;
+  if (*size > 0) {
+    heap_edges[0] = heap_edges[*size];
+    heap_scores[0] = heap_scores[*size];
+    heap_sift_down(heap_edges, heap_scores, *size, 0);
+  }
+  return 1;
+}
+
+static void heap_push(int *heap_edges, int *heap_scores, int *size, int edge_id,
+                      int score) {
+  int idx = (*size)++;
+  heap_edges[idx] = edge_id;
+  heap_scores[idx] = score;
+  heap_sift_up(heap_edges, heap_scores, idx);
+}
+
+typedef struct {
+  int edge_id;
+  int score;
+} EdgeScore;
+
+static int compare_edge_score_desc(const void *a, const void *b) {
+  const EdgeScore *ea = (const EdgeScore *)a;
+  const EdgeScore *eb = (const EdgeScore *)b;
+  if (ea->score != eb->score)
+    return (ea->score < eb->score) ? 1 : -1; // descending
+  if (ea->edge_id != eb->edge_id)
+    return (ea->edge_id > eb->edge_id) ? 1 : -1; // ascending
+  return 0;
 }
 
 static void enqueue_if_needed(int node, int *queue, int *qtail,
@@ -257,7 +358,8 @@ static void remove_core_node(int node, EdgeState *edges, const int *inc_offsets,
                              const int *inc_edges, unsigned char *in_core,
                              int *core_degree, int *core_nodes,
                              int *core_edges_arr, int *core_pos,
-                             int *core_edge_count, int *queue, int *qtail,
+                             int *core_edge_count, int maintain_core_list,
+                             int *queue, int *qtail,
                              unsigned char *in_queue) {
   if (!in_core[node])
     return;
@@ -268,7 +370,8 @@ static void remove_core_node(int node, EdgeState *edges, const int *inc_offsets,
     if (!edges[e].active)
       continue;
     if (edges[e].in_core) {
-      core_edge_remove(e, edges, core_edges_arr, core_pos, core_edge_count);
+      core_edge_remove(e, edges, core_edges_arr, core_pos, core_edge_count,
+                       maintain_core_list);
     }
     int nbr = other_endpoint(edges, e, node);
     if (in_core[nbr]) {
@@ -299,7 +402,10 @@ static void sample_core_series(LinkPercolationResult *res, int removed_edges,
 int run_link_percolation(Graph *g, uint64_t rng_seed,
                          LinkPercolationResult *result,
                          PseudoCriticalPoints *gc_ecp,
-                         int use_static_core, int use_random_all) {
+                         int use_static_core, int use_random_all,
+                         int use_biased_selection,
+                         int use_random_biased_original,
+                         int use_random_biased_adaptive) {
   const int n = g->n;
   const int m = g->m;
   if (m <= 0)
@@ -360,6 +466,7 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
 
   int core_nodes = n;
   int core_edge_count = 0;
+  int maintain_core_list = 1;
   // Prune initial 2-core.
   long long safety_core_prune = 0;
   long long max_core_prune = 10LL * n + 100000;
@@ -382,7 +489,7 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
     in_queue[node] = 0;
     remove_core_node(node, edges, incident_offsets, incident_edges, in_core,
                      core_degree, &core_nodes, core_edges_arr, core_pos,
-                     &core_edge_count, queue, &qtail, in_queue);
+                     &core_edge_count, 1, queue, &qtail, in_queue);
   }
 
   for (int e = 0; e < m; e++) {
@@ -398,30 +505,67 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   // - static: frozen copy of initial core edges
   // - random_all: all edges at start
   int *static_core_edges = NULL;
+  EdgeScore *static_scored = NULL;
   int static_remaining = 0;
+  int static_total = 0;
+  int static_cursor = 0;
   int static_mode = (use_static_core && core_edge_count > 0) ? 1 : 0;
+  int biased_mode = use_biased_selection ? 1 : 0;
+  int adaptive_biased_mode = (biased_mode && !static_mode) ? 1 : 0;
+  int static_biased_mode = (biased_mode && static_mode) ? 1 : 0;
   if (static_mode) {
     static_remaining = core_edge_count;
-    static_core_edges = (int *)malloc((size_t)static_remaining * sizeof(int));
-    if (!static_core_edges) {
-      free(incident_offsets);
-      free(incident_edges);
-      free(edges);
-      free(in_core);
-      free(in_queue);
-      free(core_degree);
-      free(queue);
-      free(core_edges_arr);
-      free(core_pos);
-      return -1;
+    static_total = core_edge_count;
+    if (static_biased_mode) {
+      static_scored =
+          (EdgeScore *)malloc((size_t)static_total * sizeof(EdgeScore));
+      if (!static_scored) {
+        free(incident_offsets);
+        free(incident_edges);
+        free(edges);
+        free(in_core);
+        free(in_queue);
+        free(core_degree);
+        free(queue);
+        free(core_edges_arr);
+        free(core_pos);
+        return -1;
+      }
+      for (int i = 0; i < static_total; i++) {
+        int eid = core_edges_arr[i];
+        int u = edges[eid].u;
+        int v = edges[eid].v;
+        static_scored[i].edge_id = eid;
+        static_scored[i].score = core_degree[u] + core_degree[v];
+      }
+      qsort(static_scored, (size_t)static_total, sizeof(EdgeScore),
+            compare_edge_score_desc);
+    } else {
+      static_core_edges = (int *)malloc((size_t)static_remaining * sizeof(int));
+      if (!static_core_edges) {
+        free(incident_offsets);
+        free(incident_edges);
+        free(edges);
+        free(in_core);
+        free(in_queue);
+        free(core_degree);
+        free(queue);
+        free(core_edges_arr);
+        free(core_pos);
+        return -1;
+      }
+      memcpy(static_core_edges, core_edges_arr,
+             (size_t)static_remaining * sizeof(int));
     }
-    memcpy(static_core_edges, core_edges_arr,
-           (size_t)static_remaining * sizeof(int));
   }
 
   int *all_edges_pool = NULL;
   int all_remaining = 0;
   int random_mode = use_random_all ? 1 : 0;
+  int random_biased_original_mode = use_random_biased_original ? 1 : 0;
+  int random_biased_adaptive_mode = use_random_biased_adaptive ? 1 : 0;
+  int random_biased_mode =
+      (random_biased_original_mode || random_biased_adaptive_mode) ? 1 : 0;
   if (random_mode) {
     all_remaining = m;
     all_edges_pool = (int *)malloc((size_t)all_remaining * sizeof(int));
@@ -436,11 +580,65 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
       free(core_edges_arr);
       free(core_pos);
       free(static_core_edges);
+      free(static_scored);
       return -1;
     }
     for (int i = 0; i < m; i++) {
       all_edges_pool[i] = i;
     }
+  }
+
+  int *active_degree = NULL;
+  if (random_biased_adaptive_mode) {
+    active_degree = (int *)malloc((size_t)n * sizeof(int));
+    if (!active_degree) {
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      free(static_core_edges);
+      free(static_scored);
+      free(all_edges_pool);
+      return -1;
+    }
+    for (int i = 0; i < n; i++) {
+      active_degree[i] = graph_degree(g, i);
+    }
+  }
+
+  EdgeScore *all_scored = NULL;
+  int all_scored_cursor = 0;
+  if (random_biased_original_mode) {
+    all_scored = (EdgeScore *)malloc((size_t)m * sizeof(EdgeScore));
+    if (!all_scored) {
+      free(incident_offsets);
+      free(incident_edges);
+      free(edges);
+      free(in_core);
+      free(in_queue);
+      free(core_degree);
+      free(queue);
+      free(core_edges_arr);
+      free(core_pos);
+      free(static_core_edges);
+      free(static_scored);
+      free(all_edges_pool);
+      free(active_degree);
+      return -1;
+    }
+    for (int e = 0; e < m; e++) {
+      int u = edges[e].u;
+      int v = edges[e].v;
+      all_scored[e].edge_id = e;
+      all_scored[e].score = graph_degree(g, u) + graph_degree(g, v);
+    }
+    qsort(all_scored, (size_t)m, sizeof(EdgeScore), compare_edge_score_desc);
+    all_scored_cursor = 0;
   }
 
   rng_state_t rng_local;
@@ -461,23 +659,64 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   sample_core_series(result, 0, core_nodes);
   double prev_core_size = (double)core_nodes;
   int removed_edges = 0;
+  int heap_size = 0;
+  int *heap_edges = core_edges_arr;
+  int *heap_scores = core_pos;
+  if (adaptive_biased_mode && core_edge_count > 0) {
+    maintain_core_list = 0;
+    heap_size = core_edge_count;
+    for (int i = 0; i < heap_size; i++) {
+      int eid = core_edges_arr[i];
+      int u = edges[eid].u;
+      int v = edges[eid].v;
+      heap_scores[i] = core_degree[u] + core_degree[v];
+    }
+    heap_build(heap_edges, heap_scores, heap_size);
+  }
+  int all_heap_size = 0;
+  if (random_biased_adaptive_mode) {
+    maintain_core_list = 0;
+    all_heap_size = m;
+    for (int i = 0; i < m; i++) {
+      heap_edges[i] = i;
+      int u = edges[i].u;
+      int v = edges[i].v;
+      heap_scores[i] = active_degree[u] + active_degree[v];
+    }
+    heap_build(heap_edges, heap_scores, all_heap_size);
+  }
 
   long long safety_core_loop = 0;
   long long max_core_loop = 10LL * m + 100000;
   while (1) {
     int active_pool = 0;
-    if (random_mode) {
+    if (random_biased_original_mode) {
+      active_pool = m - all_scored_cursor;
+    } else if (random_biased_adaptive_mode) {
+      active_pool = all_heap_size;
+    } else if (random_mode) {
       active_pool = all_remaining;
     } else if (static_mode) {
-      active_pool = static_remaining;
+      active_pool = static_biased_mode ? (static_total - static_cursor)
+                                       : static_remaining;
+    } else if (adaptive_biased_mode) {
+      // Heap contains stale/inactive edges; core_nodes controls termination.
+      active_pool = heap_size;
     } else {
       active_pool = core_edge_count;
     }
+    if (!static_mode && !(random_mode || random_biased_mode) && core_nodes <= 0)
+      break;
     if (active_pool <= 0)
       break;
     if (++safety_core_loop > max_core_loop) {
       fprintf(stderr, "Core loop safety hit (N=%d, m=%d, core_edges=%d)\n", n,
               m, core_edge_count);
+      free(static_core_edges);
+      free(static_scored);
+      free(all_scored);
+      free(all_edges_pool);
+      free(active_degree);
       free(incident_offsets);
       free(incident_edges);
       free(edges);
@@ -490,7 +729,38 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
       return -1;
     }
     int edge_id = -1;
-    if (random_mode) {
+    if (random_biased_original_mode) {
+      while (all_scored_cursor < m && edge_id < 0) {
+        int candidate = all_scored[all_scored_cursor++].edge_id;
+        if (!edges[candidate].active)
+          continue;
+        edge_id = candidate;
+      }
+      if (edge_id < 0)
+        break;
+    } else if (random_biased_adaptive_mode) {
+      while (all_heap_size > 0 && edge_id < 0) {
+        int cand = -1;
+        int cand_score = 0;
+        if (!heap_pop(heap_edges, heap_scores, &all_heap_size, &cand,
+                      &cand_score)) {
+          break;
+        }
+        if (!edges[cand].active) {
+          continue;
+        }
+        int u = edges[cand].u;
+        int v = edges[cand].v;
+        int current = active_degree[u] + active_degree[v];
+        if (current < cand_score) {
+          heap_push(heap_edges, heap_scores, &all_heap_size, cand, current);
+          continue;
+        }
+        edge_id = cand;
+      }
+      if (edge_id < 0)
+        break;
+    } else if (random_mode) {
       while (all_remaining > 0 && edge_id < 0) {
         int idx = (int)rng_range(&rng_local, (uint32_t)all_remaining);
         int candidate = all_edges_pool[idx];
@@ -508,42 +778,83 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
       }
     } else if (static_mode) {
       // Pick from the original core edge list, skipping any already inactive.
-      while (static_remaining > 0 && edge_id < 0) {
-        int idx = (int)rng_range(&rng_local, (uint32_t)static_remaining);
-        int candidate = static_core_edges[idx];
-        if (!edges[candidate].active) {
+      if (static_biased_mode) {
+        while (static_cursor < static_total && edge_id < 0) {
+          int candidate = static_scored[static_cursor++].edge_id;
+          if (!edges[candidate].active)
+            continue;
+          edge_id = candidate;
+        }
+      } else {
+        while (static_remaining > 0 && edge_id < 0) {
+          int idx = (int)rng_range(&rng_local, (uint32_t)static_remaining);
+          int candidate = static_core_edges[idx];
+          if (!edges[candidate].active) {
+            static_core_edges[idx] = static_core_edges[static_remaining - 1];
+            static_remaining--;
+            continue;
+          }
+          edge_id = candidate;
           static_core_edges[idx] = static_core_edges[static_remaining - 1];
           static_remaining--;
-          continue;
         }
-        edge_id = candidate;
-        static_core_edges[idx] = static_core_edges[static_remaining - 1];
-        static_remaining--;
       }
       if (edge_id < 0) {
         break;
       }
+    } else if (adaptive_biased_mode) {
+      int stored = 0;
+      while (heap_size > 0 && edge_id < 0) {
+        int cand = -1;
+        int cand_score = 0;
+        if (!heap_pop(heap_edges, heap_scores, &heap_size, &cand, &cand_score))
+          break;
+        if (!edges[cand].active || !edges[cand].in_core) {
+          continue;
+        }
+        int u = edges[cand].u;
+        int v = edges[cand].v;
+        int current = core_degree[u] + core_degree[v];
+        if (current < cand_score) {
+          heap_push(heap_edges, heap_scores, &heap_size, cand, current);
+          continue;
+        }
+        edge_id = cand;
+        stored = current;
+      }
+      (void)stored;
+      if (edge_id < 0)
+        break;
     } else {
       int idx = rng_range(&rng_local, (uint32_t)core_edge_count);
       edge_id = core_edges_arr[idx];
     }
     if (!edges[edge_id].active) {
       core_edge_remove(edge_id, edges, core_edges_arr, core_pos,
-                       &core_edge_count);
+                       &core_edge_count, maintain_core_list);
       continue;
     }
 
     // Physically remove only the chosen edge.
+    int was_core_edge = edges[edge_id].in_core;
     edges[edge_id].active = 0;
+    if (random_biased_adaptive_mode) {
+      int u = edges[edge_id].u;
+      int v = edges[edge_id].v;
+      if (active_degree[u] > 0)
+        active_degree[u]--;
+      if (active_degree[v] > 0)
+        active_degree[v]--;
+    }
     core_edge_remove(edge_id, edges, core_edges_arr, core_pos,
-                     &core_edge_count);
+                     &core_edge_count, maintain_core_list);
     int u = edges[edge_id].u;
     int v = edges[edge_id].v;
-    if (in_core[u]) {
+    if (was_core_edge && in_core[u]) {
       core_degree[u]--;
       enqueue_if_needed(u, queue, &qtail, in_queue, core_degree);
     }
-    if (in_core[v]) {
+    if (was_core_edge && in_core[v]) {
       core_degree[v]--;
       enqueue_if_needed(v, queue, &qtail, in_queue, core_degree);
     }
@@ -553,7 +864,8 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
       in_queue[node] = 0;
       remove_core_node(node, edges, incident_offsets, incident_edges, in_core,
                        core_degree, &core_nodes, core_edges_arr, core_pos,
-                       &core_edge_count, queue, &qtail, in_queue);
+                       &core_edge_count, maintain_core_list, queue, &qtail,
+                       in_queue);
     }
 
     result->removal_order[removed_edges++] = edge_id;
@@ -577,7 +889,7 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
   }
 
   // Remove remaining (tree) edges uniformly at random.
-  if (!random_mode) {
+  if (!(random_mode || random_biased_mode)) {
     long long safety_tree_loop = 0;
     int remaining = 0;
     for (int e = 0; e < m; e++) {
@@ -591,6 +903,11 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
         fprintf(stderr,
                 "Tree loop safety hit (N=%d, m=%d, remaining=%d, i=%d)\n", n,
                 m, remaining, i);
+        free(static_core_edges);
+        free(static_scored);
+        free(all_scored);
+        free(all_edges_pool);
+        free(active_degree);
         free(incident_offsets);
         free(incident_edges);
         free(edges);
@@ -617,6 +934,11 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
     fprintf(stderr,
             "Error: removal order length mismatch (removed=%d, m=%d)\n",
             removed_edges, m);
+    free(static_core_edges);
+    free(static_scored);
+    free(all_scored);
+    free(all_edges_pool);
+    free(active_degree);
     free(incident_offsets);
     free(incident_edges);
     free(edges);
@@ -656,7 +978,10 @@ int run_link_percolation(Graph *g, uint64_t rng_seed,
                                result, gc_ecp);
 
   free(static_core_edges);
+  free(static_scored);
+  free(all_scored);
   free(all_edges_pool);
+  free(active_degree);
   free(incident_offsets);
   free(incident_edges);
   free(edges);

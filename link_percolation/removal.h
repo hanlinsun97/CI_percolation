@@ -24,13 +24,17 @@ typedef struct {
   double core_zero_p;
 } LinkPercolationResult;
 
-LinkPercolationResult *create_link_percolation_result(int n, int m);
+LinkPercolationResult *create_link_percolation_result(int n, int m,
+                                                      int series_length);
 void free_link_percolation_result(LinkPercolationResult *result);
 void reset_link_percolation_result(LinkPercolationResult *result);
 
 int run_link_percolation(Graph *g, uint64_t rng_seed,
                          LinkPercolationResult *result,
                          PseudoCriticalPoints *gc_ecp,
-                         int use_static_core, int use_random_all);
+                         int use_static_core, int use_random_all,
+                         int use_biased_selection,
+                         int use_random_biased_original,
+                         int use_random_biased_adaptive);
 
 #endif // LINK_PERCOLATION_REMOVAL_H

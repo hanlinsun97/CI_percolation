@@ -50,8 +50,7 @@ typedef struct {
   double core_zero_p;
 } EnhancedEBEData;
 
-#define NR_OUTPUT_SAMPLES 100
-#define NR_SERIES_LENGTH (NR_OUTPUT_SAMPLES + 1)
+#define DEFAULT_OUTPUT_SAMPLES 100
 
 typedef struct EBEWriter EBEWriter;
 

@@ -47,10 +47,28 @@ L_PATTERN = re.compile(r"_L(\d+)")
 MG_PATTERN = re.compile(r"_Mg(\d+)")
 PLOT_DIR = Path("node_percolation") / "plots"
 
+# Plot saving configuration (override via configure_plot_saving()).
+_PLOT_SAVE_DIR: Path = PLOT_DIR
+_PLOT_NUMBERED: bool = False
+_PLOT_COUNTER: int = 1
+
+
+def configure_plot_saving(directory: Path, numbered: bool = False, start: int = 1) -> None:
+    """Configure where analysis plots are saved.
+
+    When numbered=True, figures are saved as 1.png, 2.png, ... (monotonic),
+    ignoring the provided stem (useful for notebooks).
+    """
+
+    global _PLOT_SAVE_DIR, _PLOT_NUMBERED, _PLOT_COUNTER
+    _PLOT_SAVE_DIR = Path(directory)
+    _PLOT_NUMBERED = bool(numbered)
+    _PLOT_COUNTER = int(start) if start is not None else 1
+
 
 def _ensure_plot_dir() -> Path:
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    return PLOT_DIR
+    _PLOT_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    return _PLOT_SAVE_DIR
 
 
 def _sanitize_stem(stem: str) -> str:
@@ -62,14 +80,22 @@ def _sanitize_stem(stem: str) -> str:
 
 def _save_figure(fig: plt.Figure, stem: str, L_value: Optional[int] = None) -> Path:
     directory = _ensure_plot_dir()
-    filename = _sanitize_stem(stem)
-    if L_value is not None:
-        filename = f"{filename}_L{L_value}"
-    path = directory / f"{filename}.png"
-    counter = 1
-    while path.exists():
-        path = directory / f"{filename}_{counter}.png"
-        counter += 1
+    global _PLOT_COUNTER
+    if _PLOT_NUMBERED:
+        while True:
+            path = directory / f"{_PLOT_COUNTER}.png"
+            _PLOT_COUNTER += 1
+            if not path.exists():
+                break
+    else:
+        filename = _sanitize_stem(stem)
+        if L_value is not None:
+            filename = f"{filename}_L{L_value}"
+        path = directory / f"{filename}.png"
+        counter = 1
+        while path.exists():
+            path = directory / f"{filename}_{counter}.png"
+            counter += 1
     fig.savefig(path, dpi=300, bbox_inches="tight")
     return path
 
@@ -298,11 +324,11 @@ def extract_fss(
         if radius is not None:
             L_values.append(radius)
         if value_kind == "mean":
-            value = float(row_data["mean"])
-            error = float(row_data["err_mean"])
+            value = float(row_data["mean"].iloc[0])
+            error = float(row_data["err_mean"].iloc[0])
         else:
-            value = float(row_data["std"])
-            error = float(row_data["err_std"])
+            value = float(row_data["std"].iloc[0])
+            error = float(row_data["err_std"].iloc[0])
         records.append(
             {
                 "N": N,
